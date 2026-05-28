@@ -110,10 +110,15 @@ def podium_accuracy(model, X_test, test_df):
     tmp["podium_prob"] = probs
     correct, total = 0, 0
     for (_, _), race in tmp.groupby(["season", "round"]):
-        pred   = set(race.nlargest(3, "podium_prob")["driver_id"].values)
-        actual = set(race[race["podium"] == 1]["driver_id"].values)
-        correct += len(pred & actual)
-        total   += len(actual)
+        pred   = (race.nlargest(3, "podium_prob")
+                  .sort_values("podium_prob", ascending=False)["driver_id"].tolist())
+        actual = (race[race["podium"] == 1]
+                  .sort_values("finish_position")["driver_id"].tolist())
+        correct += sum(
+            1 for pos, driver in enumerate(pred)
+            if pos < len(actual) and driver == actual[pos]
+        )
+        total += len(actual)
     return correct / total if total > 0 else 0.0
 
 

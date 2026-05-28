@@ -255,7 +255,11 @@ if page == "🏁 Podium Predictor":
     top3   = race_df.head(3)
     actual = (race_df[race_df["podium"]==1]
               .sort_values("finish_position")["driver_id"].tolist())
-    correct= len(set(top3["driver_id"])&set(actual))
+    # Count correct only if driver AND position both match
+    correct = sum(
+        1 for pos, driver in enumerate(top3["driver_id"].tolist())
+        if pos < len(actual) and driver == actual[pos]
+    )
 
     with col2:
         st.markdown('<p class="sec">Predicted Podium</p>', unsafe_allow_html=True)
@@ -674,9 +678,13 @@ elif page == "📈 Season Analysis":
 
     rows = []
     for (season, rnd), race in tdf.groupby(["season","round"]):
-        pred   = set(race.nlargest(3,"podium_prob")["driver_id"].values)
-        actual = set(race[race["podium"]==1]["driver_id"].values)
-        correct= len(pred & actual)
+        pred   = race.nlargest(3,"podium_prob").sort_values("podium_prob", ascending=False)["driver_id"].tolist()
+        actual_ordered = (race[race["podium"]==1]
+                          .sort_values("finish_position")["driver_id"].tolist())
+        correct = sum(
+            1 for pos, driver in enumerate(pred)
+            if pos < len(actual_ordered) and driver == actual_ordered[pos]
+        )
         rows.append({"season":season,"round":rnd,
                      "race_name":race["race_name"].iloc[0],
                      "correct":correct,
