@@ -9,3 +9,5 @@ plotly
 streamlit
 jupyter
 requests
+optuna
+shap

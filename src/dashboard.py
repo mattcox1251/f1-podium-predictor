@@ -219,7 +219,8 @@ unsafe_allow_html=True)
 
 page = st.sidebar.radio("Navigation",
     ["🏁 Podium Predictor","🔴 2026 Live Season",
-     "📊 Model Performance","🔍 Driver Deep Dive","📈 Season Analysis"],
+     "📊 Model Performance","🔍 Driver Deep Dive","📈 Season Analysis",
+     "🧠 SHAP Explainability"],
     label_visibility="collapsed")
 
 st.sidebar.divider()
@@ -745,3 +746,210 @@ elif page == "📈 Season Analysis":
                    range=[0,1.1],gridcolor="#2A2A2A"),
         xaxis=dict(title="Season"))
     st.plotly_chart(fig3, width="stretch")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 6 — SHAP EXPLAINABILITY
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif page == "🧠 SHAP Explainability":
+    import shap
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    st.markdown('<p class="sec">SHAP Explainability</p>', unsafe_allow_html=True)
+    st.markdown("""
+    **SHAP (SHapley Additive exPlanations)** shows *why* the model made each prediction —
+    not just which features matter globally, but how each feature pushed a specific
+    prediction higher or lower.
+    """)
+
+    # Extract the underlying XGBoost classifier from the pipeline
+    @st.cache_resource
+    def get_shap_explainer(_model, _X_sample):
+        """Build SHAP explainer — cached so it only runs once."""
+        try:
+            clf = _model.named_steps["c"]
+            explainer = shap.TreeExplainer(clf)
+            return explainer
+        except Exception as e:
+            return None
+
+    # Use a sample of test data for speed
+    test_df_shap = df[df["season"].isin([2024, 2025])].copy()
+    for col in ["rolling_avg_3","rolling_avg_5","points_momentum",
+                "dnf_rate_5","teammate_gap_3","con_pts_momentum","circuit_win_rate"]:
+        if col in test_df_shap.columns:
+            test_df_shap[col] = test_df_shap[col].fillna(
+                0 if any(x in col for x in ["momentum","dnf","gap","win"]) else 10)
+
+    X_shap = test_df_shap[feature_cols]
+    sample_size = min(300, len(X_shap))
+    X_sample = X_shap.sample(sample_size, random_state=42)
+
+    # Check model type — SHAP TreeExplainer works on tree models
+    clf = model.named_steps.get("c") if hasattr(model, "named_steps") else None
+    is_tree = clf is not None and hasattr(clf, "feature_importances_")
+
+    if not is_tree:
+        st.info("SHAP TreeExplainer requires a tree-based model (XGBoost or Random Forest). "
+                "The current saved model is a stacked ensemble. Reload after saving XGBoost "
+                "as best model, or re-run model.py.")
+        st.stop()
+
+    with st.spinner("Computing SHAP values (first load takes ~15 seconds)..."):
+        explainer = get_shap_explainer(model, X_sample)
+        if explainer is None:
+            st.error("Could not build SHAP explainer for this model type.")
+            st.stop()
+
+        # Scale the sample first (pipeline has StandardScaler)
+        scaler    = model.named_steps["s"]
+        X_scaled  = pd.DataFrame(scaler.transform(X_sample),
+                                  columns=feature_cols, index=X_sample.index)
+        shap_vals = explainer(X_scaled)
+
+    # ── Tab layout ────────────────────────────────────────────────────────────
+    tab1, tab2, tab3 = st.tabs(["🌍 Global Importance", "🎯 Single Race", "📊 Feature Dependence"])
+
+    # ── Tab 1: Global beeswarm ─────────────────────────────────────────────
+    with tab1:
+        st.markdown('<p class="sec">Global Feature Impact</p>', unsafe_allow_html=True)
+        st.markdown("""
+        Each dot is one driver-race. **Red = high feature value, Blue = low**.
+        Dots to the right pushed the prediction toward podium; left = away from podium.
+        """)
+        fig, ax = plt.subplots(figsize=(9, 7), facecolor="#1A1A1A")
+        shap.plots.beeswarm(shap_vals, max_display=15, show=False, color_bar=True)
+        plt.gcf().set_facecolor("#1A1A1A")
+        ax = plt.gca()
+        ax.set_facecolor("#1A1A1A")
+        ax.tick_params(colors="white")
+        ax.xaxis.label.set_color("white")
+        plt.title("SHAP Beeswarm — Global Feature Impact", color="white", pad=12)
+        plt.tight_layout()
+        st.pyplot(plt.gcf(), use_container_width=True)
+        plt.close()
+
+        st.markdown("""
+        **How to read this:**
+        - Features are ranked top-to-bottom by overall impact
+        - Wide spread = high variability in how this feature affects predictions
+        - Tight cluster near zero = feature has consistent but small effect
+        """)
+
+    # ── Tab 2: Single race waterfall ──────────────────────────────────────
+    with tab2:
+        st.markdown('<p class="sec">Single Prediction Breakdown</p>', unsafe_allow_html=True)
+        st.markdown("Pick a race and driver to see exactly why the model gave them that podium probability.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            shap_seasons = sorted(test_df_shap["season"].unique(), reverse=True)
+            sel_season   = st.selectbox("Season", shap_seasons, key="shap_season")
+        with col2:
+            shap_rounds = (test_df_shap[test_df_shap["season"]==sel_season]
+                           [["round","race_name"]].drop_duplicates().sort_values("round"))
+            rlabels = {r["round"]: f"R{r['round']} — {r['race_name']}"
+                       for _,r in shap_rounds.iterrows()}
+            sel_round = st.selectbox("Race", list(rlabels.keys()),
+                                     format_func=lambda x: rlabels[x], key="shap_round")
+
+        race_mask = ((test_df_shap["season"]==sel_season) &
+                     (test_df_shap["round"]==sel_round))
+        race_drivers = test_df_shap[race_mask]["driver_code"].dropna().unique()
+        sel_driver   = st.selectbox("Driver", sorted(race_drivers), key="shap_driver")
+
+        driver_mask = race_mask & (test_df_shap["driver_code"]==sel_driver)
+        if driver_mask.sum() == 0:
+            st.warning("No data for this selection.")
+        else:
+            driver_idx = test_df_shap[driver_mask].index[0]
+            # Find position in X_sample
+            if driver_idx in X_sample.index:
+                sample_pos = list(X_sample.index).index(driver_idx)
+                sv = shap_vals[sample_pos]
+
+                # Actual result
+                actual_podium = bool(test_df_shap.loc[driver_idx, "podium"])
+                proba = model.predict_proba(X_shap.loc[[driver_idx]])[:,1][0]
+
+                result_color = "#00C851" if actual_podium else "#E10600"
+                result_text  = "✅ PODIUM" if actual_podium else "❌ No Podium"
+                st.markdown(f"""
+                <div style='background:#1A1A1A;border:1px solid #2A2A2A;border-radius:8px;
+                padding:.8rem 1.2rem;margin:.5rem 0;display:flex;gap:2rem;align-items:center;'>
+                  <span style='font-family:Orbitron,monospace;font-size:1.2rem;font-weight:700;'>
+                    {sel_driver}</span>
+                  <span style='color:{result_color};font-weight:600;'>{result_text}</span>
+                  <span style='color:#888;font-size:.85rem;'>Model probability: {proba:.1%}</span>
+                </div>
+                """, unsafe_allow_html=True)
+
+                fig2, ax2 = plt.subplots(figsize=(9, 5), facecolor="#1A1A1A")
+                shap.plots.waterfall(sv, max_display=12, show=False)
+                plt.gcf().set_facecolor("#1A1A1A")
+                ax2 = plt.gca()
+                ax2.set_facecolor("#1A1A1A")
+                ax2.tick_params(colors="white")
+                ax2.xaxis.label.set_color("white")
+                plt.title(f"SHAP Waterfall — {sel_driver} @ {rlabels[sel_round]}",
+                          color="white", pad=10)
+                plt.tight_layout()
+                st.pyplot(plt.gcf(), use_container_width=True)
+                plt.close()
+
+                st.markdown("""
+                **How to read this:** Each bar shows how much a feature pushed the prediction
+                up (red/right) or down (blue/left) from the base rate. The final value on the
+                right is the model's raw SHAP output for this driver.
+                """)
+            else:
+                st.info("This driver-race isn't in the SHAP sample. Try a different selection "
+                        "or increase sample_size in the code.")
+
+    # ── Tab 3: Dependence plot ────────────────────────────────────────────
+    with tab3:
+        st.markdown('<p class="sec">Feature Dependence</p>', unsafe_allow_html=True)
+        st.markdown("How does one feature's value affect its SHAP impact? "
+                    "The colour shows a second interacting feature.")
+
+        feat = st.selectbox("Feature to explore", feature_cols, key="shap_feat",
+                            index=feature_cols.index("quali_position") if "quali_position" in feature_cols else 0)
+
+        feat_idx = feature_cols.index(feat)
+        feat_vals  = X_scaled[feat].values
+        shap_array = shap_vals.values[:, feat_idx]
+
+        # Color by a correlated feature
+        color_feat = "driver_champ_pos_pre"
+        color_idx  = feature_cols.index(color_feat) if color_feat in feature_cols else 0
+        color_vals = X_scaled[color_feat].values if color_feat in X_scaled.columns else feat_vals
+
+        fig3 = go.Figure(go.Scatter(
+            x=feat_vals, y=shap_array, mode="markers",
+            marker=dict(color=color_vals, colorscale="RdYlGn_r", size=5,
+                        showscale=True,
+                        colorbar=dict(title=color_feat.replace("_"," ").title(),
+                                      tickfont=dict(color="white"),
+                                      titlefont=dict(color="white"))),
+            text=[f"SHAP: {s:.3f}" for s in shap_array],
+        ))
+        fig3.add_hline(y=0, line_dash="dash", line_color="#555")
+        fig3.update_layout(
+            paper_bgcolor="#1A1A1A", plot_bgcolor="#1A1A1A",
+            font=dict(color="#FFF", family="Inter"),
+            margin=dict(l=40,r=40,t=50,b=40),
+            height=420,
+            xaxis=dict(title=feat.replace("_"," ").title(), gridcolor="#2A2A2A"),
+            yaxis=dict(title=f"SHAP value for {feat.replace('_',' ').title()}",
+                       gridcolor="#2A2A2A"),
+            title=f"Dependence Plot: {feat.replace('_',' ').title()}",
+        )
+        st.plotly_chart(fig3, width="stretch")
+        st.markdown("""
+        **How to read this:** Points above zero = this feature value pushed the prediction
+        toward podium. Points below zero = pushed away. Colour shows the interacting feature.
+        A diagonal trend means the feature has a monotonic effect; curves mean non-linear.
+        """)
