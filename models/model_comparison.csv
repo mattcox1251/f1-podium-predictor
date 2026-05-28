@@ -1,0 +1,4 @@
+model,roc_auc,avg_precision,podium_accuracy
+Logistic Regression,0.9401,0.7081,0.6377
+Random Forest,0.9432,0.7058,0.6812
+XGBoost,0.9377,0.7067,0.6594
