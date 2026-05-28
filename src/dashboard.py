@@ -1,13 +1,12 @@
 """
-dashboard.py
-------------
-Streamlit dashboard for the F1 Podium Predictor.
-
-Pages:
-  1. 🏁 Podium Predictor  — select a race, see predicted podium + probabilities
-  2. 📊 Model Performance — evaluation metrics, confusion matrix, feature importance
-  3. 🔍 Driver Deep Dive  — driver stats, circuit history, rolling form
-  4. 📈 Season Analysis   — race-by-race prediction accuracy across the test seasons
+dashboard.py  (v2)
+------------------
+Streamlit F1 Podium Predictor dashboard with 5 pages:
+  1. 🏁  Podium Predictor    — historical race predictions
+  2. 🔴  2026 Live Season    — current season live data + next race prediction
+  3. 📊  Model Performance   — metrics, feature importance, confusion matrix
+  4. 🔍  Driver Deep Dive    — per-driver stats and circuit history
+  5. 📈  Season Analysis     — race-by-race accuracy across test seasons
 
 Usage:
     streamlit run src/dashboard.py
@@ -15,14 +14,13 @@ Usage:
 
 import os
 import pickle
+import time
+import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
-from plotly.subplots import make_subplots
-
-# ── Page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(
     page_title="F1 Podium Predictor",
@@ -31,639 +29,719 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
+# ── CSS ───────────────────────────────────────────────────────────────────────
 
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Inter:wght@300;400;500;600&display=swap');
-
 :root {
-    --f1-red:    #E10600;
-    --f1-dark:   #0C0C0C;
-    --f1-card:   #1A1A1A;
-    --f1-border: #2A2A2A;
-    --f1-text:   #FFFFFF;
-    --f1-muted:  #888888;
-    --f1-gold:   #FFD700;
-    --f1-silver: #C0C0C0;
-    --f1-bronze: #CD7F32;
+    --red:#E10600; --dark:#0C0C0C; --card:#1A1A1A; --border:#2A2A2A;
+    --gold:#FFD700; --silver:#C0C0C0; --bronze:#CD7F32; --muted:#888;
 }
-
-html, body, [class*="css"] {
-    font-family: 'Inter', sans-serif;
-    background-color: var(--f1-dark);
-    color: var(--f1-text);
-}
-
-/* Header */
-.f1-header {
-    background: linear-gradient(135deg, #0C0C0C 0%, #1a0000 50%, #0C0C0C 100%);
-    border-bottom: 2px solid var(--f1-red);
-    padding: 1.5rem 2rem;
-    margin: -1rem -1rem 2rem -1rem;
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-}
-.f1-title {
-    font-family: 'Orbitron', monospace;
-    font-size: 2rem;
-    font-weight: 900;
-    color: var(--f1-text);
-    letter-spacing: 0.05em;
-    margin: 0;
-}
-.f1-title span { color: var(--f1-red); }
-.f1-subtitle {
-    font-size: 0.8rem;
-    color: var(--f1-muted);
-    letter-spacing: 0.2em;
-    text-transform: uppercase;
-    margin: 0;
-}
-
-/* Metric cards */
-.metric-card {
-    background: var(--f1-card);
-    border: 1px solid var(--f1-border);
-    border-radius: 8px;
-    padding: 1.2rem 1.5rem;
-    text-align: center;
-}
-.metric-value {
-    font-family: 'Orbitron', monospace;
-    font-size: 2rem;
-    font-weight: 700;
-    color: var(--f1-red);
-}
-.metric-label {
-    font-size: 0.75rem;
-    color: var(--f1-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    margin-top: 0.3rem;
-}
-
-/* Podium */
-.podium-container {
-    display: flex;
-    justify-content: center;
-    align-items: flex-end;
-    gap: 1rem;
-    margin: 2rem 0;
-}
-.podium-block {
-    text-align: center;
-    border-radius: 8px 8px 0 0;
-    padding: 1rem;
-    min-width: 140px;
-}
-.podium-1 { background: linear-gradient(180deg, #2a2400 0%, #1a1600 100%); border: 1px solid var(--f1-gold); height: 180px; }
-.podium-2 { background: linear-gradient(180deg, #1a1a1a 0%, #141414 100%); border: 1px solid var(--f1-silver); height: 150px; }
-.podium-3 { background: linear-gradient(180deg, #1a1200 0%, #140e00 100%); border: 1px solid var(--f1-bronze); height: 120px; }
-.podium-pos { font-family: 'Orbitron', monospace; font-size: 2rem; font-weight: 900; }
-.podium-1 .podium-pos { color: var(--f1-gold); }
-.podium-2 .podium-pos { color: var(--f1-silver); }
-.podium-3 .podium-pos { color: var(--f1-bronze); }
-.podium-driver { font-family: 'Orbitron', monospace; font-size: 0.9rem; font-weight: 700; margin: 0.5rem 0 0.3rem; }
-.podium-prob { font-size: 0.8rem; color: var(--f1-muted); }
-
-/* Section headers */
-.section-header {
-    font-family: 'Orbitron', monospace;
-    font-size: 0.85rem;
-    font-weight: 700;
-    color: var(--f1-red);
-    text-transform: uppercase;
-    letter-spacing: 0.15em;
-    border-left: 3px solid var(--f1-red);
-    padding-left: 0.75rem;
-    margin: 1.5rem 0 1rem;
-}
-
-/* Driver tag */
-.driver-tag {
-    display: inline-block;
-    background: var(--f1-card);
-    border: 1px solid var(--f1-border);
-    border-radius: 4px;
-    padding: 0.2rem 0.6rem;
-    font-family: 'Orbitron', monospace;
-    font-size: 0.75rem;
-    margin: 0.2rem;
-}
-
-/* Sidebar */
-section[data-testid="stSidebar"] {
-    background: #111111;
-    border-right: 1px solid var(--f1-border);
-}
+html,body,[class*="css"]{font-family:'Inter',sans-serif;background:var(--dark);color:#fff;}
+.f1-header{background:linear-gradient(135deg,#0C0C0C,#1a0000,#0C0C0C);
+  border-bottom:2px solid var(--red);padding:1.2rem 2rem;margin:-1rem -1rem 1.5rem -1rem;}
+.f1-title{font-family:'Orbitron',monospace;font-size:1.8rem;font-weight:900;margin:0;}
+.f1-title span{color:var(--red);}
+.f1-sub{font-size:.75rem;color:var(--muted);letter-spacing:.2em;text-transform:uppercase;margin:0;}
+.metric-card{background:var(--card);border:1px solid var(--border);border-radius:8px;
+  padding:1rem 1.2rem;text-align:center;}
+.metric-value{font-family:'Orbitron',monospace;font-size:1.8rem;font-weight:700;color:var(--red);}
+.metric-label{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;margin-top:.2rem;}
+.sec{font-family:'Orbitron',monospace;font-size:.8rem;font-weight:700;color:var(--red);
+  text-transform:uppercase;letter-spacing:.15em;border-left:3px solid var(--red);
+  padding-left:.7rem;margin:1.2rem 0 .8rem;}
+.podium-wrap{display:flex;justify-content:center;align-items:flex-end;gap:1rem;margin:1.5rem 0;}
+.pb{text-align:center;border-radius:8px 8px 0 0;padding:1rem;min-width:130px;}
+.p1{background:linear-gradient(180deg,#2a2400,#1a1600);border:1px solid var(--gold);height:170px;}
+.p2{background:linear-gradient(180deg,#1a1a1a,#141414);border:1px solid var(--silver);height:140px;}
+.p3{background:linear-gradient(180deg,#1a1200,#140e00);border:1px solid var(--bronze);height:110px;}
+.ppos{font-family:'Orbitron',monospace;font-size:1.8rem;font-weight:900;}
+.p1 .ppos{color:var(--gold);} .p2 .ppos{color:var(--silver);} .p3 .ppos{color:var(--bronze);}
+.pdrv{font-family:'Orbitron',monospace;font-size:.85rem;font-weight:700;margin:.4rem 0 .2rem;}
+.pprob{font-size:.75rem;color:var(--muted);}
+.live-badge{display:inline-block;background:#E10600;color:#fff;font-size:.65rem;
+  font-weight:700;padding:.15rem .5rem;border-radius:3px;letter-spacing:.1em;
+  text-transform:uppercase;margin-left:.5rem;vertical-align:middle;}
+section[data-testid="stSidebar"]{background:#111;border-right:1px solid var(--border);}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Load artifacts ────────────────────────────────────────────────────────────
+# ── Loaders ───────────────────────────────────────────────────────────────────
 
 @st.cache_resource
 def load_model():
-    with open("models/best_model.pkl", "rb") as f:
-        return pickle.load(f)
+    with open("models/best_model.pkl", "rb") as f: return pickle.load(f)
 
 @st.cache_resource
 def load_feature_cols():
-    with open("models/feature_cols.pkl", "rb") as f:
-        return pickle.load(f)
+    with open("models/feature_cols.pkl", "rb") as f: return pickle.load(f)
 
 @st.cache_data
 def load_data():
     df = pd.read_csv("data/processed/model_dataset.csv")
-    df["rolling_avg_3"] = df["rolling_avg_3"].fillna(10)
-    df["rolling_avg_5"] = df["rolling_avg_5"].fillna(10)
+    for col in ["rolling_avg_3","rolling_avg_5","points_momentum",
+                "dnf_rate_5","teammate_gap_3","con_pts_momentum","circuit_win_rate"]:
+        if col in df.columns:
+            df[col] = df[col].fillna(0 if "momentum" in col or "dnf" in col
+                                      or "gap" in col or "win" in col else 10)
     return df
 
 @st.cache_data
-def load_model_comparison():
+def load_comparison():
     return pd.read_csv("models/model_comparison.csv")
 
-# ── Prediction helper ─────────────────────────────────────────────────────────
+JOLPICA = "https://api.jolpi.ca/ergast/f1"
 
-def predict_race(model, df: pd.DataFrame, feature_cols: list,
-                 season: int, round_no: int) -> pd.DataFrame:
-    race = df[(df["season"] == season) & (df["round"] == round_no)].copy()
-    if race.empty:
-        return pd.DataFrame()
-    probs = model.predict_proba(race[feature_cols])[:, 1]
+def jolpica_get(endpoint, limit=100):
+    results, offset = [], 0
+    while True:
+        url = f"{JOLPICA}/{endpoint}.json?limit={limit}&offset={offset}"
+        try:
+            r = requests.get(url, timeout=8)
+            r.raise_for_status()
+        except Exception:
+            break
+        data  = r.json().get("MRData", {})
+        total = int(data.get("total", 0))
+        table = data.get("RaceTable") or data.get("StandingsTable") or {}
+        items = table.get("Races") or table.get("StandingsLists") or []
+        results.extend(items)
+        offset += limit
+        if offset >= total: break
+        time.sleep(0.5)
+    return results
+
+@st.cache_data(ttl=3600)
+def fetch_2026_results():
+    races = jolpica_get("2026/results")
+    rows = []
+    for race in races:
+        for r in race.get("Results", []):
+            pos = r["position"]
+            rows.append({
+                "round": int(race["round"]), "race_name": race["raceName"],
+                "circuit_id": race["Circuit"]["circuitId"],
+                "driver_id": r["Driver"]["driverId"],
+                "driver_code": r["Driver"].get("code",""),
+                "constructor_id": r["Constructor"]["constructorId"],
+                "grid_position": int(r.get("grid",0)),
+                "finish_position": int(pos) if pos.isdigit() else None,
+                "points": float(r.get("points",0)),
+                "status": r.get("status",""),
+                "podium": int(pos)<=3 if pos.isdigit() else False,
+                "dnf": 0 if r.get("status","")=="Finished" or r.get("status","").startswith("+") else 1,
+            })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=3600)
+def fetch_2026_quali():
+    races = jolpica_get("2026/qualifying")
+    rows = []
+    for race in races:
+        for r in race.get("QualifyingResults",[]):
+            rows.append({
+                "round": int(race["round"]),
+                "circuit_id": race["Circuit"]["circuitId"],
+                "driver_id": r["Driver"]["driverId"],
+                "driver_code": r["Driver"].get("code",""),
+                "quali_position": int(r["position"]),
+            })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=3600)
+def fetch_2026_schedule():
+    """Get full 2026 schedule including future races."""
+    races = jolpica_get("2026")
+    rows = []
+    for race in races:
+        rows.append({
+            "round": int(race["round"]),
+            "race_name": race["raceName"],
+            "circuit_id": race["Circuit"]["circuitId"],
+            "circuit_name": race["Circuit"]["circuitName"],
+            "country": race["Circuit"]["Location"]["country"],
+            "date": race.get("date",""),
+        })
+    return pd.DataFrame(rows)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def predict_race(model, df, feature_cols, season, round_no):
+    race = df[(df["season"]==season)&(df["round"]==round_no)].copy()
+    if race.empty: return pd.DataFrame()
+    probs = model.predict_proba(race[feature_cols])[:,1]
     race["podium_prob"] = probs
-    race = race.sort_values("podium_prob", ascending=False).reset_index(drop=True)
-    race["predicted_position"] = range(1, len(race) + 1)
-    return race
+    return race.sort_values("podium_prob", ascending=False).reset_index(drop=True)
 
-# ── Plotly theme ──────────────────────────────────────────────────────────────
+def podium_html(p1,p2,p3):
+    return f"""
+    <div class="podium-wrap">
+      <div class="pb p2"><div class="ppos">2</div>
+        <div class="pdrv">{p2['driver_code']}</div>
+        <div class="pprob">{p2['podium_prob']:.1%}</div></div>
+      <div class="pb p1"><div class="ppos">1</div>
+        <div class="pdrv">{p1['driver_code']}</div>
+        <div class="pprob">{p1['podium_prob']:.1%}</div></div>
+      <div class="pb p3"><div class="ppos">3</div>
+        <div class="pdrv">{p3['driver_code']}</div>
+        <div class="pprob">{p3['podium_prob']:.1%}</div></div>
+    </div>"""
 
-PLOTLY_LAYOUT = dict(
-    paper_bgcolor="#1A1A1A",
-    plot_bgcolor="#1A1A1A",
-    font=dict(color="#FFFFFF", family="Inter"),
-    margin=dict(l=40, r=40, t=50, b=40),
-)
+LAYOUT = dict(paper_bgcolor="#1A1A1A", plot_bgcolor="#1A1A1A",
+              font=dict(color="#FFF",family="Inter"),
+              margin=dict(l=40,r=40,t=50,b=40))
 
-# ── Header ────────────────────────────────────────────────────────────────────
-
-st.markdown("""
-<div class="f1-header">
-    <div>
-        <p class="f1-title">F1 <span>PODIUM</span> PREDICTOR</p>
-        <p class="f1-subtitle">Machine Learning · 2019–2024 · Random Forest</p>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-# ── Load data ─────────────────────────────────────────────────────────────────
+# ── Load ──────────────────────────────────────────────────────────────────────
 
 try:
     model        = load_model()
     feature_cols = load_feature_cols()
     df           = load_data()
-    comparison   = load_model_comparison()
+    comparison   = load_comparison()
 except FileNotFoundError as e:
-    st.error(f"Missing file: {e}. Make sure you've run data_collection.py, feature_engineering.py, and model.py first.")
+    st.error(f"Missing file: {e}. Run the pipeline scripts first.")
     st.stop()
 
-# ── Sidebar navigation ────────────────────────────────────────────────────────
+# ── Header ────────────────────────────────────────────────────────────────────
 
-st.sidebar.markdown("""
-<p style='font-family: Orbitron, monospace; font-size: 0.8rem; color: #E10600;
-   letter-spacing: 0.15em; text-transform: uppercase; margin-bottom: 1rem;'>
-   Navigation
-</p>
-""", unsafe_allow_html=True)
+st.markdown("""
+<div class="f1-header">
+  <p class="f1-title">F1 <span>PODIUM</span> PREDICTOR</p>
+  <p class="f1-sub">Machine Learning · 2019–2026 · Stacked Ensemble</p>
+</div>""", unsafe_allow_html=True)
 
-page = st.sidebar.radio(
-    "Navigation",
-    ["🏁 Podium Predictor", "📊 Model Performance", "🔍 Driver Deep Dive", "📈 Season Analysis"],
-    label_visibility="collapsed"
-)
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+st.sidebar.markdown("""<p style='font-family:Orbitron,monospace;font-size:.8rem;
+color:#E10600;letter-spacing:.15em;text-transform:uppercase;'>Navigation</p>""",
+unsafe_allow_html=True)
+
+page = st.sidebar.radio("Navigation",
+    ["🏁 Podium Predictor","🔴 2026 Live Season",
+     "📊 Model Performance","🔍 Driver Deep Dive","📈 Season Analysis"],
+    label_visibility="collapsed")
 
 st.sidebar.divider()
-st.sidebar.markdown("""
-<p style='font-size: 0.7rem; color: #555; margin-top: 1rem;'>
-Data: Jolpica API · 2019–2024<br>
-Model: Random Forest · ROC-AUC 0.943<br>
-Podium Accuracy: 68.1%
-</p>
-""", unsafe_allow_html=True)
+st.sidebar.markdown("""<p style='font-size:.7rem;color:#555;'>
+Data: Jolpica API · 2019–2026<br>
+Model: Stacked Ensemble<br>
+Features: 21 engineered signals
+</p>""", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 1 — PODIUM PREDICTOR
+# PAGE 1 — PODIUM PREDICTOR (historical)
 # ══════════════════════════════════════════════════════════════════════════════
 
 if page == "🏁 Podium Predictor":
-
-    col1, col2 = st.columns([1, 2])
-
+    col1, col2 = st.columns([1,2])
     with col1:
-        st.markdown('<p class="section-header">Select Race</p>', unsafe_allow_html=True)
-
+        st.markdown('<p class="sec">Select Race</p>', unsafe_allow_html=True)
         seasons = sorted(df["season"].unique(), reverse=True)
         season  = st.selectbox("Season", seasons)
-
-        rounds = df[df["season"] == season][["round", "race_name"]].drop_duplicates().sort_values("round")
-        round_labels = {row["round"]: f"R{row['round']} — {row['race_name']}" for _, row in rounds.iterrows()}
-        round_no = st.selectbox("Race", options=list(round_labels.keys()), format_func=lambda x: round_labels[x])
+        rounds  = (df[df["season"]==season][["round","race_name"]]
+                   .drop_duplicates().sort_values("round"))
+        rlabels = {r["round"]: f"R{r['round']} — {r['race_name']}"
+                   for _,r in rounds.iterrows()}
+        round_no = st.selectbox("Race", list(rlabels.keys()), format_func=lambda x: rlabels[x])
 
     race_df = predict_race(model, df, feature_cols, season, round_no)
-
     if race_df.empty:
-        st.warning("No data found for this race.")
+        st.warning("No data for this race.")
         st.stop()
 
-    top3    = race_df.head(3)
-    actual  = race_df[race_df["podium"] == 1]["driver_id"].tolist()
-    correct = len(set(top3["driver_id"].tolist()) & set(actual))
+    top3   = race_df.head(3)
+    actual = race_df[race_df["podium"]==1]["driver_id"].tolist()
+    correct= len(set(top3["driver_id"])&set(actual))
 
     with col2:
-        st.markdown('<p class="section-header">Predicted Podium</p>', unsafe_allow_html=True)
-
-        p1, p2, p3 = top3.iloc[0], top3.iloc[1], top3.iloc[2]
-
-        st.markdown(f"""
-        <div class="podium-container">
-            <div class="podium-block podium-2">
-                <div class="podium-pos">2</div>
-                <div class="podium-driver">{p2['driver_code']}</div>
-                <div class="podium-prob">{p2['podium_prob']:.1%}</div>
-            </div>
-            <div class="podium-block podium-1">
-                <div class="podium-pos">1</div>
-                <div class="podium-driver">{p1['driver_code']}</div>
-                <div class="podium-prob">{p1['podium_prob']:.1%}</div>
-            </div>
-            <div class="podium-block podium-3">
-                <div class="podium-pos">3</div>
-                <div class="podium-driver">{p3['driver_code']}</div>
-                <div class="podium-prob">{p3['podium_prob']:.1%}</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
+        st.markdown('<p class="sec">Predicted Podium</p>', unsafe_allow_html=True)
+        st.markdown(podium_html(top3.iloc[0], top3.iloc[1], top3.iloc[2]),
+                    unsafe_allow_html=True)
         if actual:
-            result_color = "#00C851" if correct == 3 else "#FFD700" if correct >= 1 else "#E10600"
-            st.markdown(f"""
-            <div style='text-align:center; padding: 0.5rem;
-                background: #1A1A1A; border-radius: 6px; border: 1px solid #2A2A2A;'>
-                <span style='color:{result_color}; font-family: Orbitron, monospace;
-                    font-size: 1.1rem; font-weight: 700;'>
-                    {correct}/3 Correct
-                </span>
-                <span style='color:#888; font-size: 0.8rem; margin-left: 0.5rem;'>
-                    Actual podium: {' · '.join([r.upper() for r in actual])}
-                </span>
-            </div>
-            """, unsafe_allow_html=True)
+            clr = "#00C851" if correct==3 else "#FFD700" if correct>=1 else "#E10600"
+            st.markdown(f"""<div style='text-align:center;padding:.5rem;background:#1A1A1A;
+            border-radius:6px;border:1px solid #2A2A2A;'>
+            <span style='color:{clr};font-family:Orbitron,monospace;font-size:1.1rem;font-weight:700;'>
+            {correct}/3 Correct</span>
+            <span style='color:#888;font-size:.8rem;margin-left:.5rem;'>
+            Actual: {' · '.join([r.upper() for r in actual])}</span></div>""",
+            unsafe_allow_html=True)
 
-    # Full probability chart
-    st.markdown('<p class="section-header">All Driver Probabilities</p>', unsafe_allow_html=True)
-
-    race_plot = race_df.sort_values("podium_prob")
-    colors = ["#E10600" if d in actual else "#2A2A2A" for d in race_plot["driver_id"]]
-
+    st.markdown('<p class="sec">All Driver Probabilities</p>', unsafe_allow_html=True)
+    rp = race_df.sort_values("podium_prob")
     fig = go.Figure(go.Bar(
-        x=race_plot["podium_prob"],
-        y=race_plot["driver_code"],
-        orientation="h",
-        marker_color=colors,
-        text=[f"{p:.1%}" for p in race_plot["podium_prob"]],
-        textposition="outside",
-        textfont=dict(size=11),
+        x=rp["podium_prob"], y=rp["driver_code"], orientation="h",
+        marker_color=["#E10600" if d in actual else "#2A2A2A" for d in rp["driver_id"]],
+        text=[f"{p:.1%}" for p in rp["podium_prob"]], textposition="outside",
     ))
     fig.add_vline(x=0.5, line_dash="dash", line_color="#555")
-    fig.update_layout(
-        **PLOTLY_LAYOUT,
-        height=500,
-        xaxis=dict(title="Predicted Podium Probability", tickformat=".0%", gridcolor="#2A2A2A"),
-        yaxis=dict(title=""),
-        showlegend=False,
-    )
-    st.plotly_chart(fig, width='stretch')
-    st.caption("🔴 Red bars = actual podium finishers")
+    fig.update_layout(**LAYOUT, height=480,
+        xaxis=dict(title="Podium Probability", tickformat=".0%", gridcolor="#2A2A2A"),
+        yaxis=dict(title=""), showlegend=False)
+    st.plotly_chart(fig, width="stretch")
+    st.caption("🔴 Red = actual podium finishers")
 
-    # Key race features table
-    st.markdown('<p class="section-header">Race Features</p>', unsafe_allow_html=True)
-    feature_display = race_df[[
-        "driver_code", "quali_position", "driver_champ_pos_pre",
-        "con_champ_pos_pre", "rolling_avg_3", "circuit_avg_finish",
-        "num_pit_stops", "podium_prob"
-    ]].copy()
-    feature_display.columns = [
-        "Driver", "Quali Pos", "Driver Champ Pos",
-        "Constructor Pos", "Form (Last 3)", "Circuit Avg",
-        "Pit Stops", "Podium Prob"
-    ]
-    feature_display["Podium Prob"] = feature_display["Podium Prob"].map("{:.1%}".format)
-    feature_display["Form (Last 3)"] = feature_display["Form (Last 3)"].map("{:.1f}".format)
-    feature_display["Circuit Avg"] = feature_display["Circuit Avg"].map("{:.1f}".format)
-    st.dataframe(feature_display, width='stretch', hide_index=True)
+    st.markdown('<p class="sec">Race Feature Table</p>', unsafe_allow_html=True)
+    disp_cols = ["driver_code","quali_position","driver_champ_pos_pre",
+                 "con_champ_pos_pre","rolling_avg_3","points_momentum",
+                 "dnf_rate_5","num_pit_stops","podium_prob"]
+    disp_cols = [c for c in disp_cols if c in race_df.columns]
+    disp = race_df[disp_cols].copy()
+    disp.columns = [c.replace("_"," ").title() for c in disp_cols]
+    if "Podium Prob" in disp.columns:
+        disp["Podium Prob"] = disp["Podium Prob"].map("{:.1%}".format)
+    if "Rolling Avg 3" in disp.columns:
+        disp["Rolling Avg 3"] = disp["Rolling Avg 3"].map("{:.1f}".format)
+    if "Points Momentum" in disp.columns:
+        disp["Points Momentum"] = disp["Points Momentum"].map("{:.0f}".format)
+    if "Dnf Rate 5" in disp.columns:
+        disp["Dnf Rate 5"] = disp["Dnf Rate 5"].map("{:.1%}".format)
+    st.dataframe(disp, width="stretch", hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 2 — MODEL PERFORMANCE
+# PAGE 2 — 2026 LIVE SEASON
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif page == "🔴 2026 Live Season":
+
+    st.markdown("""<p class="sec">2026 Season <span class="live-badge">LIVE</span></p>""",
+                unsafe_allow_html=True)
+
+    with st.spinner("Fetching 2026 live data..."):
+        res26   = fetch_2026_results()
+        quali26 = fetch_2026_quali()
+        sched26 = fetch_2026_schedule()
+
+    if res26.empty:
+        st.warning("No 2026 race results available yet. Check back after the first race.")
+        st.stop()
+
+    completed_rounds = sorted(res26["round"].unique())
+    last_round = max(completed_rounds)
+    next_round = last_round + 1
+
+    # ── Season summary metrics ────────────────────────────────────────────────
+    total_races = len(completed_rounds)
+    winners = res26[res26["finish_position"]==1]["driver_code"].value_counts()
+    leader  = winners.index[0] if len(winners) else "TBD"
+    leader_wins = int(winners.iloc[0]) if len(winners) else 0
+
+    driver_pts = (res26.groupby(["driver_id","driver_code"])["points"]
+                  .sum().reset_index().sort_values("points",ascending=False))
+    leader_pts = f"{int(driver_pts.iloc[0]['points'])}pts" if len(driver_pts) else "—"
+
+    c1,c2,c3,c4 = st.columns(4)
+    for col,(label,val) in zip([c1,c2,c3,c4],[
+        ("Races Complete", str(total_races)),
+        ("Championship Leader", leader),
+        ("Leader Points", leader_pts),
+        ("Leader Wins", str(leader_wins)),
+    ]):
+        col.markdown(f"""<div class="metric-card">
+        <div class="metric-value">{val}</div>
+        <div class="metric-label">{label}</div></div>""", unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # ── Driver standings ──────────────────────────────────────────────────────
+    st.markdown('<p class="sec">Driver Championship Standings</p>', unsafe_allow_html=True)
+
+    top10 = driver_pts.head(10).sort_values("points")
+    fig = go.Figure(go.Bar(
+        x=top10["points"], y=top10["driver_code"], orientation="h",
+        marker_color=["#FFD700" if i==len(top10)-1 else "#E10600"
+                      for i in range(len(top10))],
+        text=top10["points"].astype(int), textposition="outside",
+    ))
+    fig.update_layout(**LAYOUT, height=360,
+        xaxis=dict(title="Championship Points", gridcolor="#2A2A2A"),
+        yaxis=dict(title=""), showlegend=False)
+    st.plotly_chart(fig, width="stretch")
+
+    # ── Race-by-race results ──────────────────────────────────────────────────
+    st.markdown('<p class="sec">Race Winners So Far</p>', unsafe_allow_html=True)
+
+    winners_df = (res26[res26["finish_position"]==1]
+                  .sort_values("round")[["round","race_name","driver_code","constructor_id"]])
+    winners_df.columns = ["Round","Race","Winner","Constructor"]
+    st.dataframe(winners_df, width="stretch", hide_index=True)
+
+    # ── Next race prediction ──────────────────────────────────────────────────
+    next_race_info = sched26[sched26["round"]==next_round]
+    if not next_race_info.empty:
+        nri = next_race_info.iloc[0]
+        st.markdown(f'<p class="sec">Next Race Prediction — R{next_round}: {nri["race_name"]}</p>',
+                    unsafe_allow_html=True)
+        st.info(f"🏎 **{nri['race_name']}** · {nri['circuit_name']}, {nri['country']} · {nri['date']}")
+
+        # Build a synthetic feature row for each 2026 driver using historical averages
+        # Pull their last-known data from 2025 (most recent historical season in model)
+        df_2025 = df[df["season"]==df["season"].max()].copy()
+        last_2025 = (df_2025.sort_values(["driver_id","round"])
+                     .groupby("driver_id").last().reset_index())
+
+        # Get current 2026 standings
+        cur_driver_pts = (res26.groupby(["driver_id","driver_code"])
+                          .agg(points=("points","sum"),
+                               wins=("finish_position", lambda x:(x==1).sum()))
+                          .reset_index().sort_values("points",ascending=False)
+                          .reset_index(drop=True))
+        cur_driver_pts["driver_champ_pos_pre"] = cur_driver_pts.index + 1
+
+        cur_con_pts = (res26.groupby("constructor_id")
+                       .agg(points=("points","sum"))
+                       .reset_index().sort_values("points",ascending=False)
+                       .reset_index(drop=True))
+        cur_con_pts["con_champ_pos_pre"] = cur_con_pts.index + 1
+
+        # 2026 qualifying if available for next round
+        next_quali = quali26[quali26["round"]==next_round] if not quali26.empty else pd.DataFrame()
+
+        # Build prediction rows for drivers who have 2026 data
+        pred_rows = []
+        active_drivers = res26["driver_id"].unique()
+
+        for driver_id in active_drivers:
+            d_res = res26[res26["driver_id"]==driver_id]
+            d_code = d_res["driver_code"].iloc[0] if len(d_res) else driver_id[:3].upper()
+            con_id = d_res["constructor_id"].iloc[-1] if len(d_res) else "unknown"
+
+            # Standings
+            ds = cur_driver_pts[cur_driver_pts["driver_id"]==driver_id]
+            cs = cur_con_pts[cur_con_pts["constructor_id"]==con_id]
+
+            d_champ  = int(ds["driver_champ_pos_pre"].iloc[0]) if len(ds) else 10
+            d_pts    = float(ds["points"].iloc[0]) if len(ds) else 0
+            d_wins   = int(ds["wins"].iloc[0]) if len(ds) else 0
+            c_champ  = int(cs["con_champ_pos_pre"].iloc[0]) if len(cs) else 5
+            c_pts    = float(cur_con_pts[cur_con_pts["constructor_id"]==con_id]["points"].iloc[0]) if len(cs) else 0
+            c_wins   = 0
+
+            # Rolling form from 2026
+            recent = d_res.sort_values("round").tail(5)
+            fp = recent["finish_position"].fillna(20)
+            roll3 = fp.tail(3).mean() if len(fp)>=1 else 10.0
+            roll5 = fp.tail(5).mean() if len(fp)>=1 else 10.0
+            pts_mom = recent["points"].tail(3).sum()
+            dnf5 = recent["dnf"].tail(5).mean() if len(recent)>=1 else 0.0
+
+            # Circuit history from historical data
+            hist = df[(df["driver_id"]==driver_id)&(df["circuit_id"]==nri["circuit_id"])]
+            circ_avg = float(hist["finish_position"].mean()) if len(hist)>0 else 10.0
+            circ_win = float(hist["podium"].mean()) if len(hist)>0 else 0.0
+
+            # Qualifying
+            if not next_quali.empty:
+                qrow = next_quali[next_quali["driver_id"]==driver_id]
+                quali_pos = int(qrow["quali_position"].iloc[0]) if len(qrow) else 10
+            else:
+                quali_pos = int(d_res.sort_values("round")["grid_position"].iloc[-1]) if len(d_res) else 10
+
+            grid_pos = quali_pos
+
+            # Historical teammate gap (use last known)
+            hist_d = df[df["driver_id"]==driver_id]
+            tm_gap = float(hist_d["teammate_gap_3"].iloc[-1]) if ("teammate_gap_3" in df.columns and len(hist_d)>0) else 0.0
+            con_mom = 0.0
+
+            pred_rows.append({
+                "driver_id": driver_id, "driver_code": d_code,
+                "constructor_id": con_id,
+                "quali_position": quali_pos, "front_row": int(quali_pos<=2),
+                "driver_champ_pos_pre": d_champ, "driver_points_pre": d_pts,
+                "driver_wins_pre": d_wins, "con_champ_pos_pre": c_champ,
+                "con_points_pre": c_pts, "con_wins_pre": c_wins,
+                "rolling_avg_3": roll3, "rolling_avg_5": roll5,
+                "points_momentum": pts_mom, "dnf_rate_5": dnf5,
+                "teammate_gap_3": tm_gap, "con_pts_momentum": con_mom,
+                "circuit_avg_finish": circ_avg, "circuit_win_rate": circ_win,
+                "num_pit_stops": 2, "fastest_lap_rank": 10,
+                "avg_speed_kph": 220.0, "home_race": 0,
+                "grid_position": grid_pos,
+            })
+
+        if pred_rows:
+            pred_df = pd.DataFrame(pred_rows)
+            # Ensure all feature cols present
+            for col in feature_cols:
+                if col not in pred_df.columns:
+                    pred_df[col] = 0
+            probs = model.predict_proba(pred_df[feature_cols])[:,1]
+            pred_df["podium_prob"] = probs
+            pred_df = pred_df.sort_values("podium_prob", ascending=False).reset_index(drop=True)
+
+            top3p = pred_df.head(3)
+            st.markdown(podium_html(top3p.iloc[0], top3p.iloc[1], top3p.iloc[2]),
+                        unsafe_allow_html=True)
+
+            st.caption("⚠️ Next race prediction uses 2026 form data + historical circuit averages. "
+                       "Accuracy improves once qualifying results are available.")
+
+            pred_plot = pred_df.sort_values("podium_prob")
+            fig2 = go.Figure(go.Bar(
+                x=pred_plot["podium_prob"], y=pred_plot["driver_code"],
+                orientation="h",
+                marker_color=["#E10600" if i>=len(pred_plot)-3 else "#2A2A2A"
+                              for i in range(len(pred_plot))],
+                text=[f"{p:.1%}" for p in pred_plot["podium_prob"]],
+                textposition="outside",
+            ))
+            fig2.add_vline(x=0.5, line_dash="dash", line_color="#555")
+            fig2.update_layout(**LAYOUT, height=480,
+                xaxis=dict(title="Podium Probability",tickformat=".0%",gridcolor="#2A2A2A"),
+                yaxis=dict(title=""), showlegend=False)
+            st.plotly_chart(fig2, width="stretch")
+    else:
+        st.info("No upcoming race data available yet.")
+
+    # ── 2026 podium heatmap ───────────────────────────────────────────────────
+    st.markdown('<p class="sec">2026 Podium Heatmap</p>', unsafe_allow_html=True)
+    podium26 = res26[res26["finish_position"]<=3].copy()
+    if not podium26.empty:
+        heat = (podium26.groupby(["driver_code","finish_position"])
+                .size().unstack(fill_value=0).reindex(columns=[1,2,3],fill_value=0))
+        heat.columns = ["1st","2nd","3rd"]
+        heat["Total Podiums"] = heat.sum(axis=1)
+        heat = heat.sort_values("Total Podiums", ascending=False)
+        st.dataframe(heat, width="stretch")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 3 — MODEL PERFORMANCE
 # ══════════════════════════════════════════════════════════════════════════════
 
 elif page == "📊 Model Performance":
+    st.markdown('<p class="sec">Model Comparison</p>', unsafe_allow_html=True)
 
-    st.markdown('<p class="section-header">Model Comparison</p>', unsafe_allow_html=True)
-
-    # Metric cards
-    best = comparison.loc[comparison["podium_accuracy"].idxmax()]
-    c1, c2, c3, c4 = st.columns(4)
-    metrics = [
-        ("ROC-AUC", f"{best['roc_auc']:.3f}"),
-        ("Avg Precision", f"{best['avg_precision']:.3f}"),
-        ("Podium Accuracy", f"{best['podium_accuracy']:.1%}"),
-        ("Best Model", best['model'].split()[0]),
-    ]
-    for col, (label, value) in zip([c1, c2, c3, c4], metrics):
-        col.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-value">{value}</div>
-            <div class="metric-label">{label}</div>
-        </div>
-        """, unsafe_allow_html=True)
+    best_row = comparison.loc[comparison["podium_accuracy"].idxmax()]
+    c1,c2,c3,c4 = st.columns(4)
+    for col,(label,val) in zip([c1,c2,c3,c4],[
+        ("ROC-AUC", f"{best_row['roc_auc']:.3f}"),
+        ("Avg Precision", f"{best_row['avg_precision']:.3f}"),
+        ("Podium Accuracy", f"{best_row['podium_accuracy']:.1%}"),
+        ("Best Model", best_row["model"].split()[0]),
+    ]):
+        col.markdown(f"""<div class="metric-card">
+        <div class="metric-value">{val}</div>
+        <div class="metric-label">{label}</div></div>""", unsafe_allow_html=True)
 
     st.markdown("")
 
-    # Model comparison bar chart
     fig = go.Figure()
-    metric_names  = ["ROC-AUC", "Avg Precision", "Podium Accuracy"]
-    metric_cols   = ["roc_auc", "avg_precision", "podium_accuracy"]
-    bar_colors    = ["#E10600", "#FF6B35", "#FFD700"]
-
-    for metric, col, color in zip(metric_names, metric_cols, bar_colors):
-        fig.add_trace(go.Bar(
-            name=metric,
-            x=comparison["model"],
-            y=comparison[col],
-            marker_color=color,
-            text=[f"{v:.3f}" for v in comparison[col]],
-            textposition="outside",
-        ))
-
-    fig.update_layout(
-        **PLOTLY_LAYOUT,
-        barmode="group",
-        height=380,
-        yaxis=dict(range=[0, 1.1], gridcolor="#2A2A2A", title="Score"),
+    for metric,col,color in [("ROC-AUC","roc_auc","#E10600"),
+                               ("Avg Precision","avg_precision","#FF8C00"),
+                               ("Podium Accuracy","podium_accuracy","#FFD700")]:
+        fig.add_trace(go.Bar(name=metric, x=comparison["model"], y=comparison[col],
+                             marker_color=color,
+                             text=[f"{v:.3f}" for v in comparison[col]],
+                             textposition="outside"))
+    fig.update_layout(**LAYOUT, barmode="group", height=380,
+        yaxis=dict(range=[0,1.15],gridcolor="#2A2A2A",title="Score"),
         xaxis=dict(title=""),
-        legend=dict(orientation="h", y=1.1),
-    )
-    st.plotly_chart(fig, width='stretch')
+        legend=dict(orientation="h",y=1.1))
+    st.plotly_chart(fig, width="stretch")
 
     # Feature importance
-    st.markdown('<p class="section-header">Feature Importance (Random Forest)</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sec">Feature Importance</p>', unsafe_allow_html=True)
+    clf_step = None
+    if hasattr(model,"named_steps") and "c" in model.named_steps:
+        clf_step = model.named_steps["c"]
+    elif hasattr(model,"final_estimator_"):
+        # stacking — use first base estimator that has importances
+        for name, est in model.estimators_:
+            inner = est.named_steps.get("c") if hasattr(est,"named_steps") else None
+            if inner and hasattr(inner,"feature_importances_"):
+                clf_step = inner; break
 
-    clf = model.named_steps["clf"]
-    if hasattr(clf, "feature_importances_"):
-        fi = pd.Series(clf.feature_importances_, index=feature_cols).sort_values(ascending=True)
-        fig2 = go.Figure(go.Bar(
-            x=fi.values,
-            y=fi.index,
-            orientation="h",
-            marker_color="#E10600",
-            marker_line_color="#FF4444",
-            marker_line_width=1,
-        ))
-        fig2.update_layout(
-            **PLOTLY_LAYOUT,
-            height=480,
-            xaxis=dict(title="Importance", gridcolor="#2A2A2A"),
-            yaxis=dict(title=""),
-        )
-        st.plotly_chart(fig2, width='stretch')
+    if clf_step and hasattr(clf_step,"feature_importances_"):
+        cols_used = feature_cols
+        if len(clf_step.feature_importances_) == len(cols_used):
+            fi = pd.Series(clf_step.feature_importances_, index=cols_used).sort_values(ascending=True)
+            fig2 = go.Figure(go.Bar(x=fi.values, y=fi.index, orientation="h",
+                                    marker_color="#E10600"))
+            fig2.update_layout(**LAYOUT, height=500,
+                xaxis=dict(title="Importance",gridcolor="#2A2A2A"), yaxis=dict(title=""))
+            st.plotly_chart(fig2, width="stretch")
+        else:
+            st.info("Feature importance not available for stacked ensemble display.")
+    else:
+        st.info("Feature importance is displayed for tree-based models. The stacked ensemble "
+                "uses a logistic meta-learner — see individual model importances in the plots folder.")
 
     # Confusion matrix
-    st.markdown('<p class="section-header">Confusion Matrix (Test Set 2023–2024)</p>', unsafe_allow_html=True)
-
-    test_df_page = df[df["season"].isin([2023, 2024])].copy()
-    y_pred  = model.predict(test_df_page[feature_cols])
-    y_true  = test_df_page["podium"].values
-
-    from sklearn.metrics import confusion_matrix
-    cm = confusion_matrix(y_true, y_pred)
-
-    fig3 = go.Figure(go.Heatmap(
-        z=cm,
-        x=["Predicted: No Podium", "Predicted: Podium"],
-        y=["Actual: No Podium", "Actual: Podium"],
-        text=cm,
-        texttemplate="%{text}",
-        textfont=dict(size=20),
-        colorscale=[[0, "#1A1A1A"], [1, "#E10600"]],
-        showscale=False,
-    ))
-    fig3.update_layout(**PLOTLY_LAYOUT, height=300)
-    st.plotly_chart(fig3, width='stretch')
+    st.markdown('<p class="sec">Confusion Matrix (Test Set)</p>', unsafe_allow_html=True)
+    test_seasons = [2024, 2025]
+    test_df_cm = df[df["season"].isin(test_seasons)].copy()
+    if not test_df_cm.empty:
+        from sklearn.metrics import confusion_matrix
+        y_pred = model.predict(test_df_cm[feature_cols])
+        y_true = test_df_cm["podium"].values
+        cm = confusion_matrix(y_true, y_pred)
+        fig3 = go.Figure(go.Heatmap(
+            z=cm,
+            x=["Predicted: No Podium","Predicted: Podium"],
+            y=["Actual: No Podium","Actual: Podium"],
+            text=cm, texttemplate="%{text}", textfont=dict(size=20),
+            colorscale=[[0,"#1A1A1A"],[1,"#E10600"]], showscale=False,
+        ))
+        fig3.update_layout(**LAYOUT, height=300)
+        st.plotly_chart(fig3, width="stretch")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 3 — DRIVER DEEP DIVE
+# PAGE 4 — DRIVER DEEP DIVE
 # ══════════════════════════════════════════════════════════════════════════════
 
 elif page == "🔍 Driver Deep Dive":
-
-    st.markdown('<p class="section-header">Select Driver</p>', unsafe_allow_html=True)
-
+    st.markdown('<p class="sec">Select Driver</p>', unsafe_allow_html=True)
     drivers = sorted(df["driver_code"].dropna().unique())
-    driver  = st.selectbox("Driver", drivers)
+    driver  = st.selectbox("Driver", drivers, label_visibility="collapsed")
+    ddf     = df[df["driver_code"]==driver].sort_values(["season","round"])
 
-    driver_df = df[df["driver_code"] == driver].sort_values(["season", "round"])
-
-    if driver_df.empty:
-        st.warning("No data for this driver.")
+    if ddf.empty:
+        st.warning("No data.")
         st.stop()
 
-    # Summary metrics
-    c1, c2, c3, c4 = st.columns(4)
-    stats = [
-        ("Races", str(len(driver_df))),
-        ("Podiums", str(driver_df["podium"].sum())),
-        ("Podium Rate", f"{driver_df['podium'].mean():.1%}"),
-        ("Avg Finish", f"{driver_df['finish_position'].mean():.1f}"),
-    ]
-    for col, (label, value) in zip([c1, c2, c3, c4], stats):
-        col.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-value">{value}</div>
-            <div class="metric-label">{label}</div>
-        </div>
-        """, unsafe_allow_html=True)
+    c1,c2,c3,c4 = st.columns(4)
+    for col,(label,val) in zip([c1,c2,c3,c4],[
+        ("Races", str(len(ddf))),
+        ("Podiums", str(ddf["podium"].sum())),
+        ("Podium Rate", f"{ddf['podium'].mean():.1%}"),
+        ("Avg Finish", f"{ddf['finish_position'].mean():.1f}"),
+    ]):
+        col.markdown(f"""<div class="metric-card">
+        <div class="metric-value">{val}</div>
+        <div class="metric-label">{label}</div></div>""", unsafe_allow_html=True)
 
     st.markdown("")
-
-    # Rolling form chart
-    st.markdown('<p class="section-header">Finishing Position Over Time</p>', unsafe_allow_html=True)
-
-    driver_df["race_label"] = driver_df["season"].astype(str) + " R" + driver_df["round"].astype(str)
-
+    st.markdown('<p class="sec">Finishing Position Over Time</p>', unsafe_allow_html=True)
+    ddf["race_label"] = ddf["season"].astype(str)+" R"+ddf["round"].astype(str)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=driver_df["race_label"],
-        y=driver_df["finish_position"],
-        mode="lines+markers",
-        name="Finish Position",
-        line=dict(color="#E10600", width=2),
-        marker=dict(
-            color=["#FFD700" if p else "#E10600" for p in driver_df["podium"]],
-            size=8,
-        ),
-    ))
-    fig.add_trace(go.Scatter(
-        x=driver_df["race_label"],
-        y=driver_df["rolling_avg_5"],
-        mode="lines",
-        name="5-Race Rolling Avg",
-        line=dict(color="#888888", width=1.5, dash="dot"),
-    ))
-    fig.update_layout(
-        **PLOTLY_LAYOUT,
-        height=350,
-        yaxis=dict(title="Finish Position", autorange="reversed", gridcolor="#2A2A2A"),
-        xaxis=dict(title="", tickangle=45, tickfont=dict(size=9)),
-        legend=dict(orientation="h", y=1.1),
-    )
-    st.plotly_chart(fig, width='stretch')
-    st.caption("🟡 Gold markers = podium finishes")
+    fig.add_trace(go.Scatter(x=ddf["race_label"], y=ddf["finish_position"],
+        mode="lines+markers", name="Finish",
+        line=dict(color="#E10600",width=2),
+        marker=dict(color=["#FFD700" if p else "#E10600" for p in ddf["podium"]], size=7)))
+    if "rolling_avg_5" in ddf.columns:
+        fig.add_trace(go.Scatter(x=ddf["race_label"], y=ddf["rolling_avg_5"],
+            mode="lines", name="5-Race Avg",
+            line=dict(color="#888",width=1.5,dash="dot")))
+    fig.update_layout(**LAYOUT, height=340,
+        yaxis=dict(title="Finish Position",autorange="reversed",gridcolor="#2A2A2A"),
+        xaxis=dict(tickangle=45,tickfont=dict(size=8)),
+        legend=dict(orientation="h",y=1.1))
+    st.plotly_chart(fig, width="stretch")
+    st.caption("🟡 Gold = podium finish")
 
-    # Circuit history
-    st.markdown('<p class="section-header">Circuit History</p>', unsafe_allow_html=True)
-
-    circuit_stats = (
-        driver_df.groupby("circuit_id")
-        .agg(
-            races=("finish_position", "count"),
-            avg_finish=("finish_position", "mean"),
-            podiums=("podium", "sum"),
-        )
-        .reset_index()
-        .sort_values("avg_finish")
-    )
-
+    st.markdown('<p class="sec">Circuit History</p>', unsafe_allow_html=True)
+    circ = (ddf.groupby("circuit_id")
+            .agg(races=("finish_position","count"),
+                 avg_finish=("finish_position","mean"),
+                 podiums=("podium","sum"))
+            .reset_index().sort_values("avg_finish"))
     fig2 = go.Figure(go.Bar(
-        x=circuit_stats["circuit_id"],
-        y=circuit_stats["avg_finish"],
-        marker_color=circuit_stats["avg_finish"],
-        marker_colorscale=[[0, "#E10600"], [0.5, "#FF8C00"], [1, "#2A2A2A"]],
-        text=circuit_stats["podiums"].apply(lambda x: f"🏆{x}" if x > 0 else ""),
+        x=circ["circuit_id"], y=circ["avg_finish"],
+        marker_color=circ["avg_finish"],
+        marker_colorscale=[[0,"#E10600"],[0.5,"#FF8C00"],[1,"#2A2A2A"]],
+        text=circ["podiums"].apply(lambda x: f"🏆{x}" if x>0 else ""),
         textposition="outside",
     ))
-    fig2.update_layout(
-        **PLOTLY_LAYOUT,
-        height=350,
-        yaxis=dict(title="Avg Finish Position", autorange="reversed", gridcolor="#2A2A2A"),
-        xaxis=dict(title="Circuit", tickangle=45, tickfont=dict(size=9)),
-    )
-    st.plotly_chart(fig2, width='stretch')
-    st.caption("Lower = better. 🏆 = podium finishes at that circuit")
+    fig2.update_layout(**LAYOUT, height=340,
+        yaxis=dict(title="Avg Finish",autorange="reversed",gridcolor="#2A2A2A"),
+        xaxis=dict(tickangle=45,tickfont=dict(size=8)))
+    st.plotly_chart(fig2, width="stretch")
+    st.caption("Lower bar = better average. 🏆 = podiums at that circuit.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 4 — SEASON ANALYSIS
+# PAGE 5 — SEASON ANALYSIS
 # ══════════════════════════════════════════════════════════════════════════════
 
 elif page == "📈 Season Analysis":
+    st.markdown('<p class="sec">Race-by-Race Accuracy</p>', unsafe_allow_html=True)
 
-    st.markdown('<p class="section-header">Race-by-Race Prediction Accuracy</p>', unsafe_allow_html=True)
+    test_seasons = [2024, 2025]
+    tdf = df[df["season"].isin(test_seasons)].copy()
+    if tdf.empty:
+        st.warning("No test-season data available yet.")
+        st.stop()
 
-    test_df_sa = df[df["season"].isin([2023, 2024])].copy()
-    probs = model.predict_proba(test_df_sa[feature_cols])[:, 1]
-    test_df_sa["podium_prob"] = probs
+    tdf["podium_prob"] = model.predict_proba(tdf[feature_cols])[:,1]
 
-    race_results = []
-    for (season, round_no), race in test_df_sa.groupby(["season", "round"]):
-        predicted = set(race.nlargest(3, "podium_prob")["driver_id"].values)
-        actual    = set(race[race["podium"] == 1]["driver_id"].values)
-        correct   = len(predicted & actual)
-        race_results.append({
-            "season":    season,
-            "round":     round_no,
-            "race_name": race["race_name"].iloc[0],
-            "correct":   correct,
-            "label":     f"{int(season)} R{int(round_no)}",
-        })
+    rows = []
+    for (season, rnd), race in tdf.groupby(["season","round"]):
+        pred   = set(race.nlargest(3,"podium_prob")["driver_id"].values)
+        actual = set(race[race["podium"]==1]["driver_id"].values)
+        correct= len(pred & actual)
+        rows.append({"season":season,"round":rnd,
+                     "race_name":race["race_name"].iloc[0],
+                     "correct":correct,
+                     "label":f"{int(season)} R{int(rnd)}"})
 
-    race_acc = pd.DataFrame(race_results)
-    overall  = race_acc["correct"].sum() / (len(race_acc) * 3)
+    racc = pd.DataFrame(rows)
+    overall = racc["correct"].sum() / (len(racc)*3)
 
-    # Summary stats
-    c1, c2, c3, c4 = st.columns(4)
-    summary_stats = [
+    c1,c2,c3,c4 = st.columns(4)
+    for col,(label,val) in zip([c1,c2,c3,c4],[
         ("Overall Accuracy", f"{overall:.1%}"),
-        ("Perfect Predictions", str((race_acc["correct"] == 3).sum())),
-        ("Races Analyzed",  str(len(race_acc))),
-        ("Avg Correct/Race", f"{race_acc['correct'].mean():.1f}/3"),
-    ]
-    for col, (label, value) in zip([c1, c2, c3, c4], summary_stats):
-        col.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-value">{value}</div>
-            <div class="metric-label">{label}</div>
-        </div>
-        """, unsafe_allow_html=True)
+        ("Perfect (3/3)", str((racc["correct"]==3).sum())),
+        ("Races Analyzed", str(len(racc))),
+        ("Avg Correct/Race", f"{racc['correct'].mean():.1f}/3"),
+    ]):
+        col.markdown(f"""<div class="metric-card">
+        <div class="metric-value">{val}</div>
+        <div class="metric-label">{label}</div></div>""", unsafe_allow_html=True)
 
     st.markdown("")
-
-    # Race-by-race bar chart
-    color_map = {0: "#E10600", 1: "#FF8C00", 2: "#FFD700", 3: "#00C851"}
-    bar_colors = [color_map[c] for c in race_acc["correct"]]
-
+    cmap = {0:"#E10600",1:"#FF8C00",2:"#FFD700",3:"#00C851"}
     fig = go.Figure(go.Bar(
-        x=race_acc["label"],
-        y=race_acc["correct"],
-        marker_color=bar_colors,
-        text=race_acc["correct"].apply(lambda x: f"{x}/3"),
+        x=racc["label"], y=racc["correct"],
+        marker_color=[cmap[c] for c in racc["correct"]],
+        text=racc["correct"].apply(lambda x:f"{x}/3"),
         textposition="outside",
     ))
-    fig.add_hline(
-        y=race_acc["correct"].mean(),
-        line_dash="dash", line_color="#888",
-        annotation_text=f"Avg: {race_acc['correct'].mean():.1f}",
-        annotation_position="right",
-    )
-    fig.update_layout(
-        **PLOTLY_LAYOUT,
-        height=420,
-        yaxis=dict(title="Correct Podium Picks", range=[0, 4], dtick=1, gridcolor="#2A2A2A"),
-        xaxis=dict(title="", tickangle=45, tickfont=dict(size=9)),
-    )
-    st.plotly_chart(fig, width='stretch')
+    fig.add_hline(y=racc["correct"].mean(), line_dash="dash", line_color="#888",
+                  annotation_text=f"Avg {racc['correct'].mean():.1f}",
+                  annotation_position="right")
+    fig.update_layout(**LAYOUT, height=420,
+        yaxis=dict(title="Correct Podium Picks",range=[0,4],dtick=1,gridcolor="#2A2A2A"),
+        xaxis=dict(tickangle=45,tickfont=dict(size=8)))
+    st.plotly_chart(fig, width="stretch")
     st.caption("🟢 3/3 Perfect · 🟡 2/3 · 🟠 1/3 · 🔴 0/3")
 
-    # Accuracy by circuit
-    st.markdown('<p class="section-header">Accuracy by Circuit</p>', unsafe_allow_html=True)
-
-    circuit_acc = (
-        race_acc.merge(
-            test_df_sa[["season", "round", "circuit_id"]].drop_duplicates(),
-            on=["season", "round"]
-        )
-        .groupby("circuit_id")["correct"]
-        .mean()
-        .sort_values(ascending=True)
-        .reset_index()
-    )
-
+    # By circuit
+    st.markdown('<p class="sec">Accuracy by Circuit</p>', unsafe_allow_html=True)
+    cacc = (racc.merge(tdf[["season","round","circuit_id"]].drop_duplicates(),
+                       on=["season","round"])
+            .groupby("circuit_id")["correct"].mean()
+            .sort_values(ascending=True).reset_index())
     fig2 = go.Figure(go.Bar(
-        x=circuit_acc["correct"],
-        y=circuit_acc["circuit_id"],
-        orientation="h",
-        marker_color=circuit_acc["correct"],
-        marker_colorscale=[[0, "#E10600"], [0.5, "#FFD700"], [1, "#00C851"]],
-        text=[f"{v:.1f}/3" for v in circuit_acc["correct"]],
-        textposition="outside",
+        x=cacc["correct"], y=cacc["circuit_id"], orientation="h",
+        marker_color=cacc["correct"],
+        marker_colorscale=[[0,"#E10600"],[0.5,"#FFD700"],[1,"#00C851"]],
+        text=[f"{v:.1f}/3" for v in cacc["correct"]], textposition="outside",
     ))
-    fig2.update_layout(
-        **PLOTLY_LAYOUT,
-        height=500,
-        xaxis=dict(title="Avg Correct Podium Picks", range=[0, 4], gridcolor="#2A2A2A"),
-        yaxis=dict(title=""),
-    )
-    st.plotly_chart(fig2, width='stretch')
+    fig2.update_layout(**LAYOUT, height=500,
+        xaxis=dict(title="Avg Correct Picks",range=[0,4],gridcolor="#2A2A2A"),
+        yaxis=dict(title=""))
+    st.plotly_chart(fig2, width="stretch")
+
+    # Season comparison
+    st.markdown('<p class="sec">Accuracy by Season</p>', unsafe_allow_html=True)
+    sacc = racc.groupby("season").agg(
+        races=("correct","count"),
+        total_correct=("correct","sum"),
+    ).reset_index()
+    sacc["accuracy"] = sacc["total_correct"] / (sacc["races"]*3)
+    fig3 = go.Figure(go.Bar(
+        x=sacc["season"].astype(str), y=sacc["accuracy"],
+        marker_color="#E10600",
+        text=[f"{v:.1%}" for v in sacc["accuracy"]], textposition="outside",
+    ))
+    fig3.update_layout(**LAYOUT, height=300,
+        yaxis=dict(title="Podium Pick Accuracy",tickformat=".0%",
+                   range=[0,1.1],gridcolor="#2A2A2A"),
+        xaxis=dict(title="Season"))
+    st.plotly_chart(fig3, width="stretch")

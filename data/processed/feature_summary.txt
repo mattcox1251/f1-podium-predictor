@@ -1,45 +1,17 @@
 ============================================================
 F1 Podium Predictor — Feature Summary
 ============================================================
-Total rows:       2,559
-Total features:   26
-Seasons covered:  2019–2024
-Races covered:    128
-Drivers:          36
-Circuits:         31
+Rows:          3,148
+Features:      33
+Seasons:       2019–2026
+Races:         157
+Drivers:       40
+Circuits:      31
 
-Target distribution:
-  Podium (1):     384 (15.0%)
-  No podium (0):  2,175 (85.0%)
+Podium rate:   15.0%  (471 podiums / 3,148 rows)
 
-Feature columns:
-  season                              nulls: 0
-  round                               nulls: 0
-  circuit_id                          nulls: 0
-  driver_id                           nulls: 0
-  driver_code                         nulls: 0
-  constructor_id                      nulls: 0
-  grid_position                       nulls: 0
-  quali_position                      nulls: 0
-  driver_champ_pos_pre                nulls: 0
-  driver_points_pre                   nulls: 0
-  driver_wins_pre                     nulls: 0
-  con_champ_pos_pre                   nulls: 0
-  con_points_pre                      nulls: 0
-  con_wins_pre                        nulls: 0
-  rolling_avg_3                       nulls: 36
-  rolling_avg_5                       nulls: 36
-  circuit_avg_finish                  nulls: 0
-  num_pit_stops                       nulls: 0
-  fastest_lap_rank                    nulls: 0
-  avg_speed_kph                       nulls: 0
-  home_race                           nulls: 0
-
-Sample rows (first race, sorted by finish):
-driver_code  quali_position  driver_champ_pos_pre  rolling_avg_3  num_pit_stops  podium
-        BOT               2                  10.0            NaN              1       1
-        HAM               1                  10.0            NaN              1       1
-        VER               4                  10.0            NaN              1       1
-        VET               3                  10.0            NaN              1       0
-        LEC               5                  10.0            NaN              1       0
-============================================================
+Null counts per feature:
+  rolling_avg_3                       40
+  rolling_avg_5                       40
+  points_momentum                     40
+  dnf_rate_5                          40

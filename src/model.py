@@ -1,22 +1,18 @@
 """
 model.py
 --------
-Trains and evaluates three models to predict F1 podium finishes.
-
-Approach:
-  - Binary classification: podium (1) vs no podium (0)
-  - Train on 2019-2022, test on 2023-2024 (temporal split — no leakage)
-  - Models: Logistic Regression, Random Forest, XGBoost
-  - Handles class imbalance via class_weight / scale_pos_weight
-  - Evaluates per-race podium prediction accuracy (our real-world metric)
-  - Saves the best model + scaler to disk for the dashboard
+Improved model pipeline with:
+  - Richer feature set (v2 features from feature_engineering.py)
+  - TimeSeriesSplit cross-validation for robust evaluation
+  - Optuna hyperparameter tuning for XGBoost and Random Forest
+  - Stacked ensemble (LR + RF + XGB → Logistic meta-learner)
+  - Best model saved by podium pick accuracy
 
 Usage:
     python src/model.py
 
 Output:
     models/best_model.pkl
-    models/scaler.pkl
     models/feature_cols.pkl
     models/model_comparison.csv
 """
@@ -27,38 +23,37 @@ import warnings
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend for Codespaces
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from sklearn.linear_model    import LogisticRegression
-from sklearn.ensemble        import RandomForestClassifier
-from sklearn.preprocessing   import StandardScaler
-from sklearn.metrics         import (
+from sklearn.linear_model      import LogisticRegression
+from sklearn.ensemble          import RandomForestClassifier, StackingClassifier
+from sklearn.preprocessing     import StandardScaler
+from sklearn.pipeline          import Pipeline
+from sklearn.model_selection   import TimeSeriesSplit, cross_val_score
+from sklearn.metrics           import (
     classification_report, confusion_matrix,
-    roc_auc_score, precision_recall_curve, average_precision_score
+    roc_auc_score, average_precision_score
 )
-from sklearn.pipeline        import Pipeline
-from xgboost                 import XGBClassifier
+from xgboost import XGBClassifier
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 warnings.filterwarnings("ignore")
-
-# ── Configuration ─────────────────────────────────────────────────────────────
 
 PROCESSED_DIR = "data/processed"
 MODELS_DIR    = "models"
 PLOTS_DIR     = "data/processed/plots"
+for d in [MODELS_DIR, PLOTS_DIR]:
+    os.makedirs(d, exist_ok=True)
 
-os.makedirs(MODELS_DIR, exist_ok=True)
-os.makedirs(PLOTS_DIR, exist_ok=True)
+TRAIN_SEASONS = [2019, 2020, 2021, 2022, 2023]   # +1 season vs v1
+TEST_SEASONS  = [2024, 2025]
 
-# Temporal train/test split
-TRAIN_SEASONS = [2019, 2020, 2021, 2022]
-TEST_SEASONS  = [2023, 2024]
-
-# Features used by the model
 FEATURE_COLS = [
     "quali_position",
+    "front_row",
     "driver_champ_pos_pre",
     "driver_points_pre",
     "driver_wins_pre",
@@ -67,7 +62,12 @@ FEATURE_COLS = [
     "con_wins_pre",
     "rolling_avg_3",
     "rolling_avg_5",
+    "points_momentum",
+    "dnf_rate_5",
+    "teammate_gap_3",
+    "con_pts_momentum",
     "circuit_avg_finish",
+    "circuit_win_rate",
     "num_pit_stops",
     "fastest_lap_rank",
     "avg_speed_kph",
@@ -78,297 +78,258 @@ FEATURE_COLS = [
 TARGET = "podium"
 
 
-# ── Data preparation ──────────────────────────────────────────────────────────
+# ── Data ──────────────────────────────────────────────────────────────────────
 
-def load_and_split() -> tuple:
+def load_and_split():
     print("Loading dataset...")
     df = pd.read_csv(f"{PROCESSED_DIR}/model_dataset.csv")
-    print(f"  {len(df):,} rows loaded\n")
-
-    # Fill the 36 first-race nulls in rolling features with neutral value (10)
-    df["rolling_avg_3"] = df["rolling_avg_3"].fillna(10)
-    df["rolling_avg_5"] = df["rolling_avg_5"].fillna(10)
+    df["rolling_avg_3"]    = df["rolling_avg_3"].fillna(10)
+    df["rolling_avg_5"]    = df["rolling_avg_5"].fillna(10)
+    df["points_momentum"]  = df["points_momentum"].fillna(0)
+    df["dnf_rate_5"]       = df["dnf_rate_5"].fillna(0)
+    df["teammate_gap_3"]   = df["teammate_gap_3"].fillna(0)
+    df["con_pts_momentum"] = df["con_pts_momentum"].fillna(0)
+    df["circuit_win_rate"] = df["circuit_win_rate"].fillna(0)
 
     train = df[df["season"].isin(TRAIN_SEASONS)].copy()
     test  = df[df["season"].isin(TEST_SEASONS)].copy()
 
-    print(f"  Train: {len(train):,} rows ({TRAIN_SEASONS[0]}–{TRAIN_SEASONS[-1]})")
-    print(f"  Test:  {len(test):,} rows  ({TEST_SEASONS[0]}–{TEST_SEASONS[-1]})\n")
+    print(f"  Train: {len(train):,} rows  ({TRAIN_SEASONS[0]}–{TRAIN_SEASONS[-1]})")
+    print(f"  Test:  {len(test):,} rows   ({TEST_SEASONS[0]}–{TEST_SEASONS[-1]})\n")
 
-    X_train = train[FEATURE_COLS]
-    y_train = train[TARGET]
-    X_test  = test[FEATURE_COLS]
-    y_test  = test[TARGET]
-
-    return X_train, y_train, X_test, y_test, train, test, df
+    return (train[FEATURE_COLS], train[TARGET],
+            test[FEATURE_COLS],  test[TARGET],
+            train, test, df)
 
 
-# ── Model definitions ─────────────────────────────────────────────────────────
+# ── Podium accuracy metric ────────────────────────────────────────────────────
 
-def get_models() -> dict:
-    """
-    Return three models. All handle class imbalance natively via
-    class_weight or scale_pos_weight so we don't need to oversample.
-    """
-    return {
-        "Logistic Regression": Pipeline([
-            ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(
-                class_weight="balanced",
-                max_iter=1000,
-                random_state=42
-            ))
-        ]),
-        "Random Forest": Pipeline([
-            ("scaler", StandardScaler()),
-            ("clf", RandomForestClassifier(
-                n_estimators=200,
-                max_depth=6,
-                class_weight="balanced",
-                random_state=42,
-                n_jobs=-1
-            ))
-        ]),
-        "XGBoost": Pipeline([
-            ("scaler", StandardScaler()),
-            ("clf", XGBClassifier(
-                n_estimators=200,
-                max_depth=4,
-                learning_rate=0.05,
-                scale_pos_weight=7,   # ~85/15 class ratio
-                eval_metric="logloss",
-                random_state=42,
-                verbosity=0
-            ))
-        ]),
-    }
-
-
-# ── Evaluation helpers ────────────────────────────────────────────────────────
-
-def podium_prediction_accuracy(model, X_test: pd.DataFrame, test_df: pd.DataFrame) -> float:
-    """
-    Our primary real-world metric: for each race, predict the top 3 drivers
-    by highest podium probability, then check how many actual podium finishers
-    we correctly identified.
-
-    Score = (correctly predicted podium drivers) / (total actual podium slots)
-    Perfect score = 1.0 (all 3 podium spots correctly predicted every race)
-    """
+def podium_accuracy(model, X_test, test_df):
     probs = model.predict_proba(X_test)[:, 1]
-    test_copy = test_df.copy()
-    test_copy["podium_prob"] = probs
-
-    correct = 0
-    total   = 0
-
-    for (season, round_no), race in test_copy.groupby(["season", "round"]):
-        # Top 3 by predicted probability
-        predicted_podium = set(
-            race.nlargest(3, "podium_prob")["driver_id"].values
-        )
-        # Actual podium finishers
-        actual_podium = set(
-            race[race["podium"] == 1]["driver_id"].values
-        )
-        correct += len(predicted_podium & actual_podium)
-        total   += len(actual_podium)
-
+    tmp   = test_df.copy()
+    tmp["podium_prob"] = probs
+    correct, total = 0, 0
+    for (_, _), race in tmp.groupby(["season", "round"]):
+        pred   = set(race.nlargest(3, "podium_prob")["driver_id"].values)
+        actual = set(race[race["podium"] == 1]["driver_id"].values)
+        correct += len(pred & actual)
+        total   += len(actual)
     return correct / total if total > 0 else 0.0
 
 
-def evaluate_model(name: str, model, X_train, y_train, X_test, y_test, test_df) -> dict:
-    """Train, evaluate, and return metrics for one model."""
-    print(f"  Training {name}...")
-    model.fit(X_train, y_train)
+# ── Optuna tuning ─────────────────────────────────────────────────────────────
 
+def tune_xgboost(X_train, y_train, n_trials=40):
+    print("  Tuning XGBoost with Optuna...")
+    tscv = TimeSeriesSplit(n_splits=4)
+
+    def objective(trial):
+        params = dict(
+            n_estimators    = trial.suggest_int("n_estimators", 100, 600),
+            max_depth       = trial.suggest_int("max_depth", 3, 8),
+            learning_rate   = trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            subsample       = trial.suggest_float("subsample", 0.6, 1.0),
+            colsample_bytree= trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            min_child_weight= trial.suggest_int("min_child_weight", 1, 10),
+            scale_pos_weight= trial.suggest_float("scale_pos_weight", 3, 10),
+            eval_metric="logloss", random_state=42, verbosity=0,
+        )
+        clf = Pipeline([("s", StandardScaler()), ("c", XGBClassifier(**params))])
+        scores = cross_val_score(clf, X_train, y_train, cv=tscv,
+                                 scoring="average_precision", n_jobs=-1)
+        return scores.mean()
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    best = study.best_params
+    print(f"    Best avg-precision: {study.best_value:.4f}  params: {best}")
+    return Pipeline([
+        ("s", StandardScaler()),
+        ("c", XGBClassifier(**best, eval_metric="logloss",
+                            random_state=42, verbosity=0))
+    ])
+
+
+def tune_random_forest(X_train, y_train, n_trials=30):
+    print("  Tuning Random Forest with Optuna...")
+    tscv = TimeSeriesSplit(n_splits=4)
+
+    def objective(trial):
+        params = dict(
+            n_estimators = trial.suggest_int("n_estimators", 100, 500),
+            max_depth    = trial.suggest_int("max_depth", 4, 12),
+            min_samples_split = trial.suggest_int("min_samples_split", 2, 20),
+            min_samples_leaf  = trial.suggest_int("min_samples_leaf", 1, 10),
+            max_features = trial.suggest_categorical("max_features", ["sqrt", "log2", 0.5]),
+            class_weight = "balanced", random_state=42, n_jobs=-1,
+        )
+        clf = Pipeline([("s", StandardScaler()), ("c", RandomForestClassifier(**params))])
+        scores = cross_val_score(clf, X_train, y_train, cv=tscv,
+                                 scoring="average_precision", n_jobs=-1)
+        return scores.mean()
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    best = study.best_params
+    print(f"    Best avg-precision: {study.best_value:.4f}  params: {best}")
+    return Pipeline([
+        ("s", StandardScaler()),
+        ("c", RandomForestClassifier(**best, class_weight="balanced",
+                                     random_state=42, n_jobs=-1))
+    ])
+
+
+# ── Stacking ensemble ─────────────────────────────────────────────────────────
+
+def build_stacked_ensemble(xgb_pipe, rf_pipe, X_train, y_train):
+    print("  Building stacked ensemble...")
+    from sklearn.model_selection import StratifiedKFold
+    lr_base = Pipeline([
+        ("s", StandardScaler()),
+        ("c", LogisticRegression(class_weight="balanced",
+                                 max_iter=1000, random_state=42))
+    ])
+    estimators = [
+        ("xgb", xgb_pipe),
+        ("rf",  rf_pipe),
+        ("lr",  lr_base),
+    ]
+    # StratifiedKFold required by StackingClassifier (TimeSeriesSplit incompatible)
+    # Temporal ordering is already enforced by our train/test season split
+    stack = StackingClassifier(
+        estimators=estimators,
+        final_estimator=LogisticRegression(class_weight="balanced",
+                                           max_iter=500, random_state=42),
+        cv=StratifiedKFold(n_splits=5, shuffle=False),
+        stack_method="predict_proba",
+        passthrough=True,
+        n_jobs=1,   # serial to avoid joblib multiprocessing issues in Codespaces
+    )
+    stack.fit(X_train, y_train)
+    return stack
+
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+
+def evaluate(name, model, X_train, y_train, X_test, y_test, test_df):
+    if not hasattr(model, "classes_"):   # not yet fitted
+        model.fit(X_train, y_train)
     y_pred  = model.predict(X_test)
     y_proba = model.predict_proba(X_test)[:, 1]
-
-    roc_auc  = roc_auc_score(y_test, y_proba)
-    avg_prec = average_precision_score(y_test, y_proba)
-    pod_acc  = podium_prediction_accuracy(model, X_test, test_df)
-
-    print(f"    ROC-AUC:               {roc_auc:.3f}")
-    print(f"    Avg Precision (PR):    {avg_prec:.3f}")
-    print(f"    Podium Pick Accuracy:  {pod_acc:.1%}\n")
-
-    return {
-        "name":         name,
-        "model":        model,
-        "roc_auc":      roc_auc,
-        "avg_precision": avg_prec,
-        "podium_accuracy": pod_acc,
-        "y_pred":       y_pred,
-        "y_proba":      y_proba,
-    }
+    roc     = roc_auc_score(y_test, y_proba)
+    ap      = average_precision_score(y_test, y_proba)
+    pa      = podium_accuracy(model, X_test, test_df)
+    print(f"  {name}")
+    print(f"    ROC-AUC:              {roc:.4f}")
+    print(f"    Avg Precision:        {ap:.4f}")
+    print(f"    Podium Pick Accuracy: {pa:.1%}\n")
+    return {"name": name, "model": model, "roc_auc": roc,
+            "avg_precision": ap, "podium_accuracy": pa,
+            "y_pred": y_pred, "y_proba": y_proba}
 
 
 # ── Plots ─────────────────────────────────────────────────────────────────────
 
-def plot_confusion_matrix(name: str, y_test, y_pred):
-    cm = confusion_matrix(y_test, y_pred)
-    fig, ax = plt.subplots(figsize=(5, 4))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                xticklabels=["No Podium", "Podium"],
-                yticklabels=["No Podium", "Podium"], ax=ax)
-    ax.set_title(f"{name} — Confusion Matrix")
-    ax.set_ylabel("Actual")
-    ax.set_xlabel("Predicted")
+LAYOUT = dict(paper_bgcolor="#1A1A1A", plot_bgcolor="#1A1A1A",
+              font=dict(color="#FFF", family="Inter"),
+              margin=dict(l=40, r=40, t=50, b=40))
+
+def save_feature_importance(model, feature_cols):
+    try:
+        clf = model.named_steps["c"] if hasattr(model, "named_steps") else None
+        if clf is None or not hasattr(clf, "feature_importances_"):
+            return
+        fi = pd.Series(clf.feature_importances_, index=feature_cols).sort_values()
+        fig, ax = plt.subplots(figsize=(8, 7), facecolor="#1A1A1A")
+        fi.plot(kind="barh", ax=ax, color="#E10600")
+        ax.set_facecolor("#1A1A1A")
+        ax.tick_params(colors="white")
+        ax.set_title("Feature Importance (Best Model)", color="white")
+        ax.set_xlabel("Importance", color="white")
+        plt.tight_layout()
+        plt.savefig(f"{PLOTS_DIR}/feature_importance.png", dpi=120, facecolor="#1A1A1A")
+        plt.close()
+    except Exception as e:
+        print(f"  [WARN] Could not save feature importance: {e}")
+
+def save_model_comparison(results):
+    names = [r["name"] for r in results]
+    x     = np.arange(len(names))
+    w     = 0.25
+    fig, ax = plt.subplots(figsize=(9, 5), facecolor="#1A1A1A")
+    ax.bar(x - w, [r["roc_auc"] for r in results],      w, label="ROC-AUC",       color="#E10600")
+    ax.bar(x,     [r["avg_precision"] for r in results], w, label="Avg Precision", color="#FF8C00")
+    ax.bar(x + w, [r["podium_accuracy"] for r in results], w, label="Podium Acc", color="#FFD700")
+    ax.set_xticks(x); ax.set_xticklabels(names, color="white")
+    ax.set_facecolor("#1A1A1A"); ax.tick_params(colors="white")
+    ax.set_title("Model Comparison", color="white")
+    ax.set_ylim(0, 1.15); ax.legend(facecolor="#2A2A2A", labelcolor="white")
     plt.tight_layout()
-    path = f"{PLOTS_DIR}/{name.lower().replace(' ', '_')}_confusion.png"
-    plt.savefig(path, dpi=120)
+    plt.savefig(f"{PLOTS_DIR}/model_comparison.png", dpi=120, facecolor="#1A1A1A")
     plt.close()
-    print(f"    Saved confusion matrix → {path}")
-
-
-def plot_feature_importance(name: str, model, feature_cols: list):
-    """Plot feature importance for tree-based models."""
-    clf = model.named_steps["clf"]
-
-    if hasattr(clf, "feature_importances_"):
-        importances = clf.feature_importances_
-    elif hasattr(clf, "coef_"):
-        importances = np.abs(clf.coef_[0])
-    else:
-        return
-
-    fi = pd.Series(importances, index=feature_cols).sort_values(ascending=True)
-
-    fig, ax = plt.subplots(figsize=(7, 6))
-    fi.plot(kind="barh", ax=ax, color="steelblue")
-    ax.set_title(f"{name} — Feature Importance")
-    ax.set_xlabel("Importance")
-    plt.tight_layout()
-    path = f"{PLOTS_DIR}/{name.lower().replace(' ', '_')}_feature_importance.png"
-    plt.savefig(path, dpi=120)
-    plt.close()
-    print(f"    Saved feature importance → {path}")
-
-
-def plot_model_comparison(results: list):
-    """Bar chart comparing all three models across key metrics."""
-    names    = [r["name"] for r in results]
-    roc      = [r["roc_auc"] for r in results]
-    avg_prec = [r["avg_precision"] for r in results]
-    pod_acc  = [r["podium_accuracy"] for r in results]
-
-    x = np.arange(len(names))
-    width = 0.25
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.bar(x - width, roc,      width, label="ROC-AUC",            color="steelblue")
-    ax.bar(x,         avg_prec, width, label="Avg Precision (PR)",  color="darkorange")
-    ax.bar(x + width, pod_acc,  width, label="Podium Pick Accuracy", color="green")
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(names)
-    ax.set_ylim(0, 1.1)
-    ax.set_ylabel("Score")
-    ax.set_title("Model Comparison")
-    ax.legend()
-    ax.axhline(0.85, linestyle="--", color="gray", alpha=0.5, label="85% baseline")
-    plt.tight_layout()
-    path = f"{PLOTS_DIR}/model_comparison.png"
-    plt.savefig(path, dpi=120)
-    plt.close()
-    print(f"\n  Saved model comparison → {path}")
-
-
-def plot_podium_probs_sample(best_result: dict, test_df: pd.DataFrame):
-    """
-    For a single sample race, plot predicted podium probabilities per driver.
-    Picks the last race in the test set.
-    """
-    probs = best_result["y_proba"]
-    test_copy = test_df.copy()
-    test_copy["podium_prob"] = probs
-
-    # Pick the last race in 2024
-    last_race = test_copy[test_copy["season"] == 2024].tail(1)[["season", "round"]]
-    if last_race.empty:
-        return
-    s, r = last_race.iloc[0]["season"], last_race.iloc[0]["round"]
-
-    race = test_copy[(test_copy["season"] == s) & (test_copy["round"] == r)].copy()
-    race = race.sort_values("podium_prob", ascending=True)
-
-    colors = ["gold" if p == 1 else "steelblue" for p in race["podium"]]
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    bars = ax.barh(race["driver_code"], race["podium_prob"], color=colors)
-    ax.set_xlabel("Predicted Podium Probability")
-    ax.set_title(f"Podium Probabilities — Season {int(s)} Round {int(r)}\n(gold = actual podium)")
-    ax.axvline(0.5, linestyle="--", color="red", alpha=0.5)
-    plt.tight_layout()
-    path = f"{PLOTS_DIR}/sample_race_probabilities.png"
-    plt.savefig(path, dpi=120)
-    plt.close()
-    print(f"  Saved sample race plot → {path}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("F1 Podium Predictor — Model Training")
-    print("=" * 60)
+    print("F1 Podium Predictor — Improved Model Training")
+    print("=" * 60 + "\n")
 
     X_train, y_train, X_test, y_test, train_df, test_df, full_df = load_and_split()
 
-    models  = get_models()
-    results = []
+    # 1. Tune base models
+    xgb_pipe = tune_xgboost(X_train, y_train, n_trials=40)
+    rf_pipe  = tune_random_forest(X_train, y_train, n_trials=30)
 
-    print("Training and evaluating models...")
+    # 2. Fit tuned base models
+    print("  Fitting tuned base models...")
+    xgb_pipe.fit(X_train, y_train)
+    rf_pipe.fit(X_train, y_train)
+
+    lr_pipe = Pipeline([
+        ("s", StandardScaler()),
+        ("c", LogisticRegression(class_weight="balanced", max_iter=1000, random_state=42))
+    ])
+    lr_pipe.fit(X_train, y_train)
+
+    # 3. Build stacked ensemble
+    stack = build_stacked_ensemble(xgb_pipe, rf_pipe, X_train, y_train)
+
+    # 4. Evaluate all
+    print("\nEvaluating models on test set...")
     print("-" * 60)
+    results = [
+        evaluate("Logistic Regression", lr_pipe,  X_train, y_train, X_test, y_test, test_df),
+        evaluate("Random Forest (tuned)", rf_pipe, X_train, y_train, X_test, y_test, test_df),
+        evaluate("XGBoost (tuned)",      xgb_pipe, X_train, y_train, X_test, y_test, test_df),
+        evaluate("Stacked Ensemble",     stack,    X_train, y_train, X_test, y_test, test_df),
+    ]
 
-    for name, model in models.items():
-        result = evaluate_model(name, model, X_train, y_train, X_test, y_test, test_df)
-        plot_confusion_matrix(name, y_test, result["y_pred"])
-        plot_feature_importance(name, model, FEATURE_COLS)
-        results.append(result)
-
-    # ── Model comparison ──────────────────────────────────────────────────────
-    plot_model_comparison(results)
-
-    # ── Pick best model by podium accuracy ───────────────────────────────────
     best = max(results, key=lambda r: r["podium_accuracy"])
-    print(f"\n  Best model: {best['name']} "
-          f"(podium accuracy: {best['podium_accuracy']:.1%})")
+    print(f"Best model: {best['name']}  (podium accuracy {best['podium_accuracy']:.1%})")
 
-    plot_podium_probs_sample(best, test_df)
-
-    # ── Save best model, scaler, and feature list ─────────────────────────────
-    print("\nSaving best model to disk...")
+    # 5. Save
+    save_feature_importance(best["model"], FEATURE_COLS)
+    save_model_comparison(results)
 
     with open(f"{MODELS_DIR}/best_model.pkl", "wb") as f:
         pickle.dump(best["model"], f)
-
     with open(f"{MODELS_DIR}/feature_cols.pkl", "wb") as f:
         pickle.dump(FEATURE_COLS, f)
 
-    # Save model comparison table
     comparison = pd.DataFrame([{
-        "model":            r["name"],
-        "roc_auc":          round(r["roc_auc"], 4),
-        "avg_precision":    round(r["avg_precision"], 4),
-        "podium_accuracy":  round(r["podium_accuracy"], 4),
+        "model": r["name"], "roc_auc": round(r["roc_auc"], 4),
+        "avg_precision": round(r["avg_precision"], 4),
+        "podium_accuracy": round(r["podium_accuracy"], 4),
     } for r in results])
     comparison.to_csv(f"{MODELS_DIR}/model_comparison.csv", index=False)
 
-    print(f"  Saved best_model.pkl   → {MODELS_DIR}/")
-    print(f"  Saved feature_cols.pkl → {MODELS_DIR}/")
-    print(f"  Saved model_comparison.csv → {MODELS_DIR}/")
-
-    # ── Full classification report for best model ─────────────────────────────
     print(f"\nClassification Report — {best['name']}:")
     print("-" * 60)
-    print(classification_report(
-        y_test, best["y_pred"],
-        target_names=["No Podium", "Podium"]
-    ))
+    print(classification_report(y_test, best["y_pred"],
+                                 target_names=["No Podium", "Podium"]))
 
     print("=" * 60)
-    print("Model training complete!")
-    print("Next step: run dashboard.py")
+    print("Training complete! Next: run dashboard.py")
     print("=" * 60)
