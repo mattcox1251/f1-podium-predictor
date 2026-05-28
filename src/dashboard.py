@@ -253,7 +253,8 @@ if page == "🏁 Podium Predictor":
         st.stop()
 
     top3   = race_df.head(3)
-    actual = race_df[race_df["podium"]==1]["driver_id"].tolist()
+    actual = (race_df[race_df["podium"]==1]
+              .sort_values("finish_position")["driver_id"].tolist())
     correct= len(set(top3["driver_id"])&set(actual))
 
     with col2:

@@ -43,7 +43,7 @@ f1-podium-predictor/
 
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/f1-podium-predictor
+git clone https://github.com/mattcox1251/f1-podium-predictor
 cd f1-podium-predictor
 
 # Create virtual environment
@@ -144,3 +144,7 @@ A learning project before starting a Data Science program. Covers the full DS wo
 data collection → cleaning → EDA → feature engineering → modelling → evaluation → deployment.
 
 **Stack:** Python · pandas · scikit-learn · XGBoost · Optuna · SHAP · Streamlit · Plotly
+
+
+URL: https://f1-podium-predictor.streamlit.app/
+
